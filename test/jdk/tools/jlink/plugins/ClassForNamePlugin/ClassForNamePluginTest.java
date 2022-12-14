@@ -74,7 +74,8 @@ public class ClassForNamePluginTest {
     private final String CLASS_NOT_FOUND_EXCEPTION = "java/lang/ClassNotFoundException";
     private final String PLUGIN_NAME = "class-for-name";
     private static final String MODULE_NAME = "mymodule";
-    private static final String LDC_FILE_NAME = "LdcClass.class";
+    private static final String IMPOSSIBLE_TRANSFORMATION_FILE = "ImpossibleTransformation.class";
+    private static final String DATAFLOW_FILE = "Dataflow.class";
     private static final String TEST_SRC = System.getProperty("test.src");
     private static final Path SRC_DIR = Paths.get(TEST_SRC, "src");
     private static final Path MODS_DIR = Paths.get("mods");
@@ -131,12 +132,12 @@ public class ClassForNamePluginTest {
     @Test
     public void testCarryingCorrectLdc() throws Throwable, Exception {
 
-        generateClassFile();
+        generateImpossibleTransformationClassFile();
 
-        Path path = Paths.get(LDC_FILE_NAME);
+        Path path = Paths.get(IMPOSSIBLE_TRANSFORMATION_FILE);
         byte[] arr = Files.readAllBytes(path);
         ResourcePoolManager resourcesMgr = new ResourcePoolManager();
-        ResourcePoolEntry resource = ResourcePoolEntry.create("/test/" + LDC_FILE_NAME, arr);
+        ResourcePoolEntry resource = ResourcePoolEntry.create("/test/" + IMPOSSIBLE_TRANSFORMATION_FILE, arr);
         resourcesMgr.add(resource);
 
         ClassForNamePlugin plugin = new ClassForNamePlugin();
@@ -158,18 +159,18 @@ public class ClassForNamePluginTest {
 
                     for (MethodNode mn : cn.methods) {
                         if (mn.name.equals("test")) {
+                            
                             for (AbstractInsnNode insn : mn.instructions) {
                                 if (insn instanceof MethodInsnNode) {
 
                                     MethodInsnNode methodInsn = (MethodInsnNode) insn;
-
                                     if (methodInsn.owner.equals("java/lang/invoke/MethodHandles$Lookup") &&
-                                        methodInsn.name.equals("ensureInitialized") &&
-                                        methodInsn.desc.equals("(Ljava/lang/Class;)Ljava/lang/Class;") &&
-                                        methodInsn.getOpcode() == INVOKEVIRTUAL) {
+                                            methodInsn.name.equals("ensureInitialized") &&
+                                            methodInsn.desc.equals("(Ljava/lang/Class;)Ljava/lang/Class;") &&
+                                            methodInsn.getOpcode() == INVOKEVIRTUAL) {
 
                                         throw new AssertionError("Transformation shouldn't have happened. " +
-                                                "We only known parameter to test at runtime.");
+                                                "Parameter at top of stack is only known at runtime - not statically known.");
                                     }
                                 }
                             }
@@ -179,14 +180,15 @@ public class ClassForNamePluginTest {
     }
 
     /**
-     * Generates a class file with roughly the following bytecode
+     * Generates a class file where the parameter for Class.forName is only known at runtime.
+     * Bytecode reads roughly as follows
      * test(String s) {
      *      ldc "mypackage.ClassForNameTest" // a valid class for the Class.forName operation
      *      aload 0 // loads S
      *      invokestatic  // Method java/lang/Class.forName:(Ljava/lang/String;)Ljava/lang/Class;
      * }
      */
-    private static void generateClassFile() throws Throwable {
+    private static void generateImpossibleTransformationClassFile() throws Throwable {
         ClassWriter cw = new ClassWriter(0);
         MethodVisitor mv;
 
@@ -246,21 +248,167 @@ public class ClassForNamePluginTest {
                     false);
             mv.visitInsn(POP);
             mv.visitInsn(RETURN);
-            mv.visitMaxs(1, 2);
+            mv.visitMaxs(2, 2);
             mv.visitEnd();
 
         }
 
         cw.visitEnd();
 
-        File generated = new File(LDC_FILE_NAME);
+        File generated = new File(IMPOSSIBLE_TRANSFORMATION_FILE);
         generated.createNewFile();
-        FileOutputStream os = new FileOutputStream(LDC_FILE_NAME);
+        FileOutputStream os = new FileOutputStream(IMPOSSIBLE_TRANSFORMATION_FILE);
         os.write(cw.toByteArray());
         os.close();
 
         assertTrue(executeProcess("javap", "-c", "-verbose",
-                LDC_FILE_NAME)
+                IMPOSSIBLE_TRANSFORMATION_FILE)
+                .outputTo(System.out)
+                .errorTo(System.out)
+                .getExitValue() == 0); // For debugging
+    }
+
+
+    /**
+     * Verifies the transformation is not dependent on a specific sequence of bytecode instructions.
+     * Accomplishes that by verifying transformation is successful as the value at the top of the
+     * stack for Class.forName call is an ldc'd value.
+     */
+    @Test
+    public void testDataFlowAnalysis() throws Throwable, Exception {
+
+        generateDataFlowClassFile();
+
+        Path path = Paths.get(DATAFLOW_FILE);
+        byte[] arr = Files.readAllBytes(path);
+        ResourcePoolManager resourcesMgr = new ResourcePoolManager();
+        ResourcePoolEntry resource = ResourcePoolEntry.create("/test/" + DATAFLOW_FILE, arr);
+        resourcesMgr.add(resource);
+
+        ClassForNamePlugin plugin = new ClassForNamePlugin();
+        Map<String, String> prop = new HashMap<>();
+        prop.put(plugin.getName(), "global");
+        plugin.configure(prop);
+
+        ResourcePoolManager resultMgr = new ResourcePoolManager();
+        ResourcePool resPool = plugin.transform(resourcesMgr.resourcePool(),
+                resultMgr.resourcePoolBuilder());
+
+        resPool.entries()
+                .forEach(r -> {
+                    byte[] inBytes = r.contentBytes();
+                    ClassReader cr = new ClassReader(inBytes);
+                    ClassNode cn = new ClassNode();
+                    cr.accept(cn, SKIP_FRAMES);
+
+
+                    for (MethodNode mn : cn.methods) {
+                        if (mn.name.equals("test")) {
+                            for (AbstractInsnNode insn : mn.instructions) {
+                                if (insn instanceof MethodInsnNode) {
+
+                                    MethodInsnNode methodInsn = (MethodInsnNode) insn;
+                                    if (methodInsn.owner.equals("java/lang/Class") &&
+                                            methodInsn.name.equals("forName") &&
+                                            methodInsn.desc.equals("(Ljava/lang/String;)Ljava/lang/Class;") &&
+                                            methodInsn.getOpcode() == INVOKESTATIC) {
+
+                                        throw new AssertionError("Failed to transform Class.forName call" +
+                                                "despite existing data flow analysis.");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+    }
+
+    /**
+     * Generates a class file with instructions between ldc and CNF call, ultimately leaving an ldc
+     * value at the top of stack for the CNF call. Relevant bytecode reads roughly as follows:
+     * test(String s) {
+     *      ldc "mypackage.ClassForNameTest" // a valid class for the Class.forName operation
+     *      aload 0 // loads S
+     *      pop
+     *      invokestatic  // Method java/lang/Class.forName:(Ljava/lang/String;)Ljava/lang/Class;
+     * }
+     */
+    private static void generateDataFlowClassFile() throws Throwable {
+        ClassWriter cw = new ClassWriter(0);
+        MethodVisitor mv;
+
+        cw.visit(49, ACC_PUBLIC + ACC_SUPER,
+                "LdcClass",
+                null,
+                "java/lang/Object",
+                null);
+
+        cw.visitSource("LdcClass.java", null);
+
+        {
+            mv = cw.visitMethod(ACC_PUBLIC, "<init>", "()V", null, null);
+            mv.visitVarInsn(ALOAD, 0);
+            mv.visitMethodInsn(INVOKESPECIAL,
+                    "java/lang/Object",
+                    "<init>",
+                    "()V",
+                    false);
+            mv.visitInsn(RETURN);
+            mv.visitMaxs(1, 1);
+            mv.visitEnd();
+        }
+
+        {
+            mv = cw.visitMethod(ACC_PUBLIC | ACC_STATIC,
+                    "main",
+                    "([Ljava/lang/String;)V",
+                    null,
+                    new String[] { "java/lang/Exception" });
+
+            mv.visitLdcInsn("Garbage");
+            mv.visitMethodInsn(INVOKESTATIC,
+                    "LdcClass",
+                    "test",
+                    "(Ljava/lang/String;)V",
+                    false);
+
+            mv.visitInsn(RETURN);
+            mv.visitMaxs(1, 1);
+            mv.visitEnd();
+        }
+
+        {
+            mv = cw.visitMethod(ACC_PUBLIC | ACC_STATIC,
+                    "test",
+                    "(Ljava/lang/String;)V",
+                    null,
+                    new String[] { "java/lang/Exception" });
+
+            mv.visitLdcInsn("mypackage.ClassForNameTest");
+            mv.visitVarInsn(ALOAD, 0);
+            mv.visitInsn(POP);
+            mv.visitMethodInsn(INVOKESTATIC,
+                    "java/lang/Class",
+                    "forName",
+                    "(Ljava/lang/String;)Ljava/lang/Class;",
+                    false);
+            mv.visitInsn(POP);
+            mv.visitInsn(RETURN);
+            mv.visitMaxs(2, 2);
+            mv.visitEnd();
+
+        }
+
+        cw.visitEnd();
+
+        File generated = new File(DATAFLOW_FILE);
+        generated.createNewFile();
+        FileOutputStream os = new FileOutputStream(DATAFLOW_FILE);
+        os.write(cw.toByteArray());
+        os.close();
+
+        assertTrue(executeProcess("javap", "-c", "-verbose",
+                DATAFLOW_FILE)
                 .outputTo(System.out)
                 .errorTo(System.out)
                 .getExitValue() == 0); // For debugging
@@ -388,8 +536,8 @@ public class ClassForNamePluginTest {
     }
 
     private void nestedAllFinallyCallsTransformedTest(MethodNode mn) {
-        assert(mn.tryCatchBlocks.size() == 3) : "Exceptions for nested try catch finally calls were not removed." +
-                expectedVsActualMessage(3, mn.tryCatchBlocks.size());
+        assert(mn.tryCatchBlocks.size() == 2) : "Exceptions for nested try catch finally calls were not removed." +
+                expectedVsActualMessage(2, mn.tryCatchBlocks.size());
     }
 
     private void nestedSomeCallsTransformedTest(MethodNode mn) {

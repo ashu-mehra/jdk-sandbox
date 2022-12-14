@@ -24,6 +24,9 @@
  */
 package jdk.tools.jlink.internal.plugins;
 
+import java.io.FileWriter;
+import java.io.IOException;
+import java.text.SimpleDateFormat;
 import java.util.*;
 
 import jdk.internal.org.objectweb.asm.ClassReader;
@@ -33,8 +36,11 @@ import jdk.internal.org.objectweb.asm.MethodVisitor;
 import jdk.internal.org.objectweb.asm.Opcodes;
 import jdk.internal.org.objectweb.asm.Type;
 import jdk.internal.org.objectweb.asm.tree.*;
-import jdk.tools.jlink.internal.RemoveDeadCodeAdapter;
-import jdk.tools.jlink.internal.PluginRepository;
+import jdk.internal.org.objectweb.asm.tree.analysis.Analyzer;
+import jdk.internal.org.objectweb.asm.tree.analysis.AnalyzerException;
+import jdk.internal.org.objectweb.asm.tree.analysis.BasicValue;
+import jdk.internal.org.objectweb.asm.tree.analysis.Frame;
+import jdk.tools.jlink.internal.*;
 import jdk.tools.jlink.plugin.ResourcePool;
 import jdk.tools.jlink.plugin.ResourcePoolBuilder;
 import jdk.tools.jlink.plugin.ResourcePoolModule;
@@ -49,9 +55,23 @@ public final class ClassForNamePlugin implements Plugin {
     private static final String CLASS_NOT_FOUND_EXCEPTION = "java/lang/ClassNotFoundException";
     private boolean isGlobalTransformation;
     private final DependencyPluginFactory factory;
+    private final String REPORT_FILE_NAME = "cfn_report.txt";
+    private final FileWriter reportWriter;
 
     public ClassForNamePlugin() {
         this.factory = new DependencyPluginFactory();
+
+        try {
+            reportWriter = new FileWriter(REPORT_FILE_NAME);
+            SimpleDateFormat formatter = new SimpleDateFormat("dd/MM/yyyy HH:mm:ss");
+            Date date = new Date();
+            reportWriter.write(String.format("------------ Class.forName Plugin Transformation " +
+                    "Report generated On %s ------------\n", formatter.format(date)));
+
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+
     }
 
     private static String binaryClassName(String path) {
@@ -137,78 +157,123 @@ public final class ClassForNamePlugin implements Plugin {
         cr.accept(cn, 0);
         List<MethodNode> ms = cn.methods;
         boolean modified = false;
-        LdcInsnNode ldc = null;
+        LdcInsnNode ldc;
         String thisPackage = getPackage(binaryClassName(resource.path()));
+        String moduleName = resource.moduleName();
+        String path = resource.path();
 
         for (MethodNode mn : ms) {
-            InsnList il = mn.instructions;
-            Iterator<AbstractInsnNode> it = il.iterator();
+            Analyzer<BasicValue> analyzer = new Analyzer<>(new ConstantInterpreter());
+            try {
+                analyzer.analyze(cn.name, mn);
+            } catch (AnalyzerException e) {
+                throw new RuntimeException(e);
+            }
 
+            InsnList il = mn.instructions;
             /* Map of exception handlers and their covered ranges */
             Map<TryCatchBlockNode, TryCatchState> handlers = new HashMap<>();
             for (TryCatchBlockNode tryCatch : mn.tryCatchBlocks) {
                 handlers.put(tryCatch, new TryCatchState());
             }
 
-            while (it.hasNext()) {
-                AbstractInsnNode insn = it.next();
-
-                if (insn instanceof LdcInsnNode) {
-                    ldc = (LdcInsnNode)insn;
-                } else if (insn instanceof MethodInsnNode && ldc != null) {
+            int instructionIndex = 0;
+            Frame<BasicValue>[] frames = analyzer.getFrames();
+            ListIterator<AbstractInsnNode> iterator = il.iterator();
+            while (iterator.hasNext()) {
+                AbstractInsnNode insn = iterator.next();
+                if (insn instanceof MethodInsnNode ) {
                     MethodInsnNode min = (MethodInsnNode)insn;
-
                     if (min.getOpcode() == Opcodes.INVOKESTATIC &&
                             min.name.equals("forName") &&
-                            min.owner.equals("java/lang/Class") &&
-                            min.desc.equals("(Ljava/lang/String;)Ljava/lang/Class;")) {
+                            min.owner.equals("java/lang/Class")) {
                         boolean isTransformed = false;
                         int callIndex = il.indexOf(insn);
-                        String ldcClassName = ldc.cst.toString();
-                        String thatClassName = ldcClassName.replaceAll("\\.", "/");
+                        TransformationEntry entry = new TransformationEntry(path, mn.name, callIndex, moduleName);
 
-                        if (isGlobalTransformation) {
-                            /* Blindly transform bytecode */
-                            modifyInstructions(ldc, il, min, thatClassName);
-                            modified = true;
-                            isTransformed = true;
-                        } else {
-                            /* Transform calls for classes within the same module */
-                            Optional<ResourcePoolEntry> thatClass =
-                                    pool.findEntryInContext(thatClassName + ".class", resource);
+                        if (min.desc.equals("(Ljava/lang/String;)Ljava/lang/Class;")) {
+                            BasicValue arg;
+                            try {
+                                arg = getStackValue(instructionIndex, 0, frames);
 
-                            if (thatClass.isPresent()) {
-                                int thatAccess = getAccess(thatClass.get());
-                                String thatPackage = getPackage(thatClassName);
-
-                                if ((thatAccess & Opcodes.ACC_PRIVATE) != Opcodes.ACC_PRIVATE &&
-                                        ((thatAccess & Opcodes.ACC_PUBLIC) == Opcodes.ACC_PUBLIC ||
-                                                thisPackage.equals(thatPackage))) {
+                            } catch (AnalyzerException e) {
+                                throw new RuntimeException(e);
+                            }
+                            if (arg instanceof StringValue value && value.getContents() != null) { // ((StringValue) arg)
+                                ldc = value.getLdcNode();
+                                String thatClassName = value.getContents().replaceAll("\\.", "/");
+                                entry.addParameter(thatClassName);
+                                if (isGlobalTransformation) {
+                                    /* Blindly transform bytecode */
                                     modifyInstructions(ldc, il, min, thatClassName);
                                     modified = true;
                                     isTransformed = true;
+                                } else {
+                                    /* Transform calls for classes within the same module */
+                                    Optional<ResourcePoolEntry> thatClass =
+                                            pool.findEntryInContext(thatClassName + ".class", resource);
 
+                                    if (thatClass.isPresent()) {
+                                        int thatAccess = getAccess(thatClass.get());
+                                        String thatPackage = getPackage(thatClassName);
+
+                                        if ((thatAccess & Opcodes.ACC_PRIVATE) != Opcodes.ACC_PRIVATE &&
+                                                ((thatAccess & Opcodes.ACC_PUBLIC) == Opcodes.ACC_PUBLIC ||
+                                                        thisPackage.equals(thatPackage))) {
+                                            modifyInstructions(ldc, il, min, thatClassName);
+                                            modified = true;
+                                            isTransformed = true;
+                                        }
+                                    } else {
+                                        /* Check module graph to see if class is accessible */
+                                        ResourcePoolModule targetModule = getTargetModule(pool, thatClassName);
+                                        if (targetModule != null
+                                                && ModuleGraphPlugin.isAccessible(thatClassName,
+                                                resource.moduleName(), targetModule.name())) {
+                                            modifyInstructions(ldc, il, min, thatClassName);
+                                            modified = true;
+                                            isTransformed = true;
+                                        }
+                                    }
                                 }
-                            } else {
-                                /* Check module graph to see if class is accessible */
-                                ResourcePoolModule targetModule = getTargetModule(pool, thatClassName);
-                                if (targetModule != null
-                                        && ModuleGraphPlugin.isAccessible(thatClassName,
-                                        resource.moduleName(), targetModule.name())) {
-                                    modifyInstructions(ldc, il, min, thatClassName);
-                                    modified = true;
-                                    isTransformed = true;
+                                updateHandlerMap(callIndex, handlers, isTransformed, il);
+                            }
+                            if (! isTransformed) {
+                                if (arg != null && ! (arg instanceof StringValue)) {
+                                    entry.addParameter("<Runtime Value>");
+                                }
+                                try {
+                                    reportWriter.write(entry.toString());
+                                } catch (IOException e) {
+                                    throw new RuntimeException(e);
                                 }
                             }
+                        } else if (min.desc.equals("(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;")) {
+                            // using the Class.forName with multiple trparameters.
+                            for (int k = 2; k > -1; k--) {
+                                BasicValue otherArg;
+                                try {
+                                    otherArg = getStackValue(instructionIndex, k, frames);
+                                    if (otherArg instanceof BooleanValue value) {
+                                        entry.addParameter(String.valueOf(value.getValue()));
+                                    } else if (otherArg instanceof StringValue value) {
+                                        entry.addParameter(value.getContents());
+                                    } else {
+                                        entry.addParameter("<Runtime Value>");
+                                    }
+                                } catch (AnalyzerException e) {
+                                    throw new RuntimeException(e);
+                                }
+                            }
+                            try {
+                                reportWriter.write(entry.toString());
+                            } catch (IOException e) {
+                                throw new RuntimeException(e);
+                            }
                         }
-                        updateHandlerMap(callIndex, handlers, isTransformed, il);
                     }
-                    ldc = null;
-                } else if (!(insn instanceof LabelNode) &&
-                        !(insn instanceof LineNumberNode)) {
-                    ldc = null;
                 }
-
+                instructionIndex++;
             }
             removeUnreachableExceptionHandlers(handlers, mn);
         }
@@ -226,6 +291,15 @@ public final class ClassForNamePlugin implements Plugin {
         }
 
         return resource;
+    }
+
+    private BasicValue getStackValue(int instructionIndex, int frameIndex, Frame<BasicValue>[] frames) throws AnalyzerException {
+        Frame<BasicValue> f = frames[instructionIndex];
+        if (f == null) {
+            return null;
+        }
+        int top = f.getStackSize() - 1;
+        return frameIndex <= top ? f.getStack(top - frameIndex) : null;
     }
 
     private static void removeUnreachableExceptionHandlers(Map<TryCatchBlockNode, TryCatchState> handlers, MethodNode mn) {
@@ -266,6 +340,13 @@ public final class ClassForNamePlugin implements Plugin {
                         out.add(resource);
                     }
                 });
+
+        try {
+            reportWriter.close();
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+
         return out.build();
     }
     @Override
